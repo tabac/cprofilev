@@ -7,6 +7,8 @@ try:
 except ImportError:
     from io import StringIO
 import argparse
+import urllib
+import os
 import re
 
 
@@ -36,6 +38,27 @@ stats_template = """\
             % if callees:
                 <h2>Called:</h2>
                 <pre>{{ !callees }}</pre>
+        </body>
+    </html>"""
+
+index_template = """\
+    <html>
+        <head>
+            <title>cProfile Results Index</title>
+        </head>
+        <body>
+            <h1>cProfile Statistics:</h1>
+
+            % if links:
+                <h3>Loaded pStats files:</h3>
+                <pre>{{ !links }}</pre>
+            % end
+
+            % if unsupported_links:
+                </br>
+                <h3>Unsupported files:</h3>
+                <pre>{{ !unsupported_links }}</pre>
+            % end
         </body>
     </html>"""
 
@@ -86,7 +109,6 @@ class CProfileVStats(object):
 
     @classmethod
     def _process_header(cls, output):
-        result = []
         lines = output.splitlines(True)
         for idx, line in enumerate(lines):
             match = re.search(cls.HEADER_LINE_REGEX, line)
@@ -141,26 +163,76 @@ class CProfileVStats(object):
 
 
 class CProfileV(object):
-    def __init__(self, cprofile_output, address='127.0.0.1', port=4000,
-                 quiet=True):
+    def __init__(self, cprofile_output, watch_directory=None,
+                 address='127.0.0.1', port=4000, quiet=True):
         self.cprofile_output = cprofile_output
         self.port = port
         self.address = address
         self.quiet = quiet
         self.app = Bottle()
-        self.stats_obj = CProfileVStats(self.cprofile_output)
 
-        # init route.
-        self.app.route('/')(self.route_handler)
+        if os.path.isdir(watch_directory):
+            self.watch_directory = os.path.normpath(watch_directory)
+        else:
+            self.watch_directory = None
 
-    def route_handler(self):
+        self.setup_routing()
+
+    def load_stats_objects(self):
+        self.stats_obj = {}
+        self.unsupported_files = []
+
+        if self.watch_directory:
+            directory_entries = os.listdir(self.watch_directory)
+            cprofile_output_files = [
+                d for d in directory_entries if os.path.isfile(d)
+            ]
+        else:
+            cprofile_output_files = self.cprofile_output
+
+        for cprofile_output in cprofile_output_files:
+            try:
+                stats_object = CProfileVStats(cprofile_output)
+            except Exception:
+                self.unsupported_files.append(cprofile_output)
+            else:
+                self.stats_obj[cprofile_output] = stats_object
+
+    def setup_routing(self):
+        self.app.route('/', 'GET', self.index)
+        self.app.route('/cprofile_output/<name>', 'GET', self.route_handler)
+
+    def index(self):
+        if self.watch_directory:
+            self.load_stats_objects()
+
+        links_html = ''
+        link_template = '<a href="/cprofile_output/{2}">{2}</a><br />'
+        for cprofile_output in self.stats_obj.keys():
+            links_html += link_template.format(
+                self.address, self.port, urllib.quote_plus(cprofile_output)
+            )
+
+        unsupported_links_html = ''
+        for cprofile_output in self.unsupported_files:
+            unsupported_links_html += cprofile_output + '<br />'
+
+        data = {
+            'links': links_html,
+            'unsupported_links': unsupported_links_html,
+        }
+        return template(index_template, **data)
+
+    def route_handler(self, name):
         func_name = request.query.get(FUNC_NAME_KEY) or ''
         sort = request.query.get(SORT_KEY) or ''
 
-        stats = self.stats_obj.sort(sort).show(func_name).read()
+        stats_obj = self.stats_obj[name]
+
+        stats = stats_obj.sort(sort).show(func_name).read()
         if func_name:
-            callers = self.stats_obj.sort(sort).show_callers(func_name).read()
-            callees = self.stats_obj.sort(sort).show_callees(func_name).read()
+            callers = stats_obj.sort(sort).show_callers(func_name).read()
+            callees = stats_obj.sort(sort).show_callees(func_name).read()
         else:
             callers = ''
             callees = ''
@@ -192,15 +264,20 @@ def main():
     parser.add_argument('-p', '--port', type=int, default=4000,
                         help='specify the port to listen on. '
                         '(defaults to 4000)')
-    parser.add_argument('cprofile_output', help='The cProfile output to view.')
+    parser.add_argument('-w', '--watch', type=str,
+                        help='specify a directory to watch for cProfile '
+                        'output files. If added ignores other arguments.')
+    parser.add_argument('cprofile_output', help='The cProfile output to view.',
+                        default=[], nargs='*')
     args = vars(parser.parse_args())
 
     port = args['port']
     address = args['address']
     cprofile_output = args['cprofile_output']
+    watch_directory = args['watch']
     quiet = not args['verbose']
 
-    CProfileV(cprofile_output, address, port, quiet).start()
+    CProfileV(cprofile_output, watch_directory, address, port, quiet).start()
 
 
 if __name__ == '__main__':
